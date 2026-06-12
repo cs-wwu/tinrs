@@ -1,0 +1,176 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Clipmap strip update compute shader. Evaluates terrain for new/dirty ring
+// buffer entries when the camera scrolls.
+//
+// Update modes:
+//   0 = chunk fill (chunk_vertex_dim^2 threads, one dispatch per chunk)
+//   1 = single row strip (ring_size threads)
+//   2 = single column strip (ring_size threads)
+//   3 = row + column (diagonal movement, 2N-1 threads)
+//
+// Per-vertex output: vec4(z_fine, z_delta, normal_x, normal_z).
+//
+// Multi-tile SSBO layout (binding 1):
+//   Header (5 uint32s): tile_count, features, mlp_hidden_dim, num_outputs, has_catalog
+//   Directory (tile_count x 9 uint32s each):
+//     origin_x(f32), origin_z(f32), resolution_h, resolution_w,
+//     grid_uints, elev_min(f32), elev_max(f32), data_offset, grad_scale(f32)
+//   Weights data: concatenated per-tile [grid | dequant | MLP] blocks
+//
+// has_catalog distinguishes "catalog loaded, no tiles streamed yet" (ocean
+// fallback) from "no catalog at all" (procedural fallback).
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer RingBuffer { vec4 data[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Weights { uint weights_raw[]; };
+// Spatial dir grid: one u32 per 1 deg x 1 deg world cell, stores `dir_idx + 1`
+// (0 = empty). Mirrors `coords.GRID_*`.
+layout(std430, set = 0, binding = 3) readonly buffer DirGrid { uint dir_grid[]; };
+
+// Feature-plane INR eval, spatial tile lookup, and shared coords constants.
+// Logic-only include: it reads the `weights_raw` and `dir_grid` SSBOs declared
+// above (binding numbers may differ in other includers; only the names match).
+#include "terrain_inr.glsl"
+
+// Field order matters: std430 forces vec2/uvec2 to 8-byte alignment, so
+// cam_anchor must sit at an 8-aligned offset (here 48). Trailing scalar
+// chunk_vertex_dim packs into the remaining 4 bytes without padding.
+layout(push_constant) uniform PC {
+    uint ring_size;          // level-wide vertex grid side
+    uint update_mode;        // 0=chunk-fill, 1=row, 2=column, 3=row+col
+    int strip_row;           // row index to update (modes 1/3)
+    int strip_col;           // column index to update (modes 2/3)
+    uvec2 scroll_offset;     // toroidal origin, pre-mod'd to [0, ring_size) on CPU
+    vec2 level_origin;       // camera-relative (snapped_pos - cam_anchor), arcsec
+    float grid_spacing;      // arcsec between adjacent vertices
+    uint level_base_offset;  // entry offset into shared ring buffer
+    uvec2 chunk_origin;      // chunk's level-relative (col, row) origin (mode 0)
+    vec2 cam_anchor;         // camera world pos rounded to integer arcsec
+    uint chunk_vertex_dim;   // chunk_cells + 1 (mode 0 stride)
+};  // 60 bytes
+
+// Stand-in when no INR weights are loaded.
+float evalProceduralTerrain(vec2 world_pos) {
+    vec2 t = world_pos / TILE_ARCSEC;
+    return sin(t.x * 6.0) * cos(t.y * 8.0) * 2000.0 + 1500.0
+         + sin(t.x * 25.0 + 1.0) * cos(t.y * 30.0) * 500.0
+         + sin(t.x * 120.0) * sin(t.y * 100.0) * 100.0;
+}
+
+void main() {
+    uint thread_id = gl_GlobalInvocationID.x;
+
+    int row, col;
+
+    if (update_mode == 0) {
+        uint chunk_threads = chunk_vertex_dim * chunk_vertex_dim;
+        if (thread_id >= chunk_threads) return;
+        uint local_row = thread_id / chunk_vertex_dim;
+        uint local_col = thread_id % chunk_vertex_dim;
+        row = int(local_row + chunk_origin.y);
+        col = int(local_col + chunk_origin.x);
+    } else if (update_mode == 1) {
+        if (thread_id >= ring_size) return;
+        row = strip_row;
+        col = int(thread_id);
+    } else if (update_mode == 2) {
+        if (thread_id >= ring_size) return;
+        row = int(thread_id);
+        col = strip_col;
+    } else {
+        // Row + column (diagonal scroll)
+        if (thread_id >= 2 * ring_size - 1) return;
+        if (thread_id < ring_size) {
+            row = strip_row;
+            col = int(thread_id);
+        } else {
+            uint col_thread = thread_id - ring_size;
+            row = int(col_thread);
+            // Skip the intersection point (already covered by the row pass).
+            if (row >= strip_row) row++;
+            col = strip_col;
+        }
+    }
+
+    float half_extent = float(ring_size) / 2.0;
+    // world_pos_rel is the camera-relative position (small, high precision
+    // because the CPU did the snapped_pos - cam subtract in f64). Absolute
+    // world coords are only needed for tile lookup and cos(lat); we
+    // reconstruct them as rel + anchor, accepting f32 ULP at large
+    // longitudes since both consumers are robust to sub-arcsec error.
+    vec2 world_pos_rel = level_origin + vec2(
+        float(col) - half_extent,
+        float(row) - half_extent
+    ) * grid_spacing;
+
+    // No chunk-level radial skip here, even though chunks at the level
+    // corners (chunk_center > r_outer_keep) are dropped by the CPU radial
+    // cull. The toroidal ring rotates buf slots as the camera scrolls, so a
+    // buf slot that's "in a corner chunk" at write time will rotate into a
+    // kept chunk's abstract position after enough scrolling (~32 cells).
+    // Skipping the write leaves that slot at the buffer's initial zeros, and
+    // a few seconds of flight later the vertex shader reads those zeros and
+    // renders a flat green patch. The cell's world_pos is constant across
+    // rotations, so we must write correct elevation at strip/refill time.
+    //
+    // TODO: a real optimization could pair a per-cell validity bit with a
+    // vertex-shader fallback (render invalid cells as ocean), then it would
+    // be safe to skip the eval for corner cells.
+
+    vec2 world_pos_abs = world_pos_rel + cam_anchor;
+
+    int center_tile = findTile(world_pos_abs);
+
+    const float PI = 3.14159265358979;
+    float lat_rad = -world_pos_abs.y / 3600.0 * (PI / 180.0);
+    float cos_lat = max(cos(lat_rad), 0.01);
+
+    vec3 normal;
+    float z_fine;
+    float water_logit = -1.0;
+
+    if (center_tile >= 0) {
+        float gx, gz;
+        float z_meters = evalPlaneINRDirect(world_pos_rel, cam_anchor, center_tile, gx, gz, water_logit);
+        z_fine = z_meters * HEIGHT_SCALE;
+        float dzdx = gx * HEIGHT_SCALE;
+        float dzdz = gz * HEIGHT_SCALE;
+        normal = normalize(vec3(-dzdx, cos_lat, -dzdz * cos_lat));
+    } else if (getHasCatalog() != 0) {
+        // Catalog present, this position not covered or not streamed (ocean).
+        z_fine = 0.0;
+        normal = vec3(0.0, 1.0, 0.0);
+    } else {
+        // --procedural mode: debug fallback wave terrain.
+        z_fine = evalProceduralTerrain(world_pos_abs) * HEIGHT_SCALE;
+        normal = vec3(0.0, 1.0, 0.0);
+    }
+
+    // scroll_offset is pre-mod'd to [0, ring_size) on the CPU and row/col are
+    // non-negative, so plain unsigned modulo works. (GLSL's `%` on negatives
+    // is implementation-defined and produces wrong writes on NVIDIA.)
+    uint buf_row = (uint(row) + scroll_offset.y) % ring_size;
+    uint buf_col = (uint(col) + scroll_offset.x) % ring_size;
+    uint buf_idx = level_base_offset + buf_row * ring_size + buf_col;
+
+    // Water from INR logit. Outside tiles with a catalog = ocean.
+    float isWater;
+    if (center_tile < 0 && getHasCatalog() != 0) {
+        isWater = 1.0;
+    } else {
+        isWater = water_logit > 0.0 ? 1.0 : 0.0;
+    }
+    // Water flag packed as an offset on normal.z. normal.z is in [-1,1], so the
+    // offset must exceed 2.0 to keep water (offset+[-1,1]) clear of land ([-1,1]):
+    // a +2.0 offset overlapped in [1,1.5) and a steep-shore water vertex with
+    // normal.z < -0.5 misdecoded as land with a garbage normal (bright terrain
+    // diamond at shorelines). +4.0 -> water in [3,5], land in [-1,1], threshold 2.0.
+    float stored_nz = normal.z + (isWater > 0.5 ? 4.0 : 0.0);
+
+    // TODO: compute z_delta by sampling parent level's ring buffer for geomorphing
+    // (z_delta = z_coarse - z_fine, blended at level edges by vertex shader alpha)
+    data[buf_idx] = vec4(z_fine, 0.0, normal.x, stored_nz);
+}

@@ -1,0 +1,70 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Terrain probe: evaluates the terrain INR at a single world point (the aircraft,
+// straight down) and writes the height + a display-ready AGL. Shares the exact
+// INR eval / tile lookup the clipmap uses (terrain_inr.glsl), so the probed
+// height can never disagree with the rendered terrain.
+//
+// The result stays GPU-resident: the HUD's numeric pipeline reads `agl_m` and
+// decodes the digits in its vertex shader, so the value never round-trips to the
+// CPU. `elevation_m` is the general, reusable terrain-height primitive (later:
+// FPM ground-intersection, glide footprint, TAWS).
+//
+// Single point for now; the dispatch is 1 thread. TODO: generalize to an array
+// of probe points (FPM touchdown / glide ring) when those features land.
+
+layout(local_size_x = 1) in;
+
+// Same buffers the clipmap binds (referenced by name from the shared include).
+// Binding numbers are local to this pass's descriptor set; only the instance
+// array names (weights_raw / dir_grid) must match terrain_inr.glsl.
+layout(std430, set = 0, binding = 0) readonly buffer Weights { uint weights_raw[]; };
+layout(std430, set = 0, binding = 1) readonly buffer DirGrid { uint dir_grid[]; };
+
+layout(std430, set = 0, binding = 2) writeonly buffer ProbeOut {
+    float elevation_m;   // terrain height under the aircraft (meters, MSL frame)
+    float water_logit;   // INR water output at the point
+    int   agl_m;         // display-ready AGL = round(msl - elev), clamped >= 0
+    int   tile_found;     // 1 if an INR tile covers the point, 0 = ocean / no-data
+};
+
+layout(push_constant) uniform PC {
+    vec2 aircraft_world;   // absolute arcsec (lon, -lat) under the aircraft
+    float observer_msl_m;  // aircraft MSL altitude, meters
+};
+
+#include "terrain_inr.glsl"
+
+void main() {
+    // Anchor at the query point itself: world_rel stays ~0 (maximal f32 precision)
+    // and the probe needs no input from the clipmap's camera-relative frame.
+    vec2 world_abs = aircraft_world;
+    vec2 cam_anchor = round(world_abs);
+    vec2 world_rel = world_abs - cam_anchor;
+
+    int tile = findTile(world_abs);
+
+    float elev;
+    float water = -1.0;
+    if (tile >= 0) {
+        float gx, gz;
+        elev = evalPlaneINRDirect(world_rel, cam_anchor, tile, gx, gz, water);
+        tile_found = 1;
+    } else {
+        // No tile: ocean / no-data. Ground is sea level, so AGL == MSL.
+        elev = 0.0;
+        tile_found = 0;
+    }
+
+    elevation_m = elev;
+    water_logit = water;
+    // Display-ready AGL in meters, clamped to [0, 9999]. Low clamp guards
+    // terrain-DB-above-GPS-MSL (negative); high clamp saturates over-range AGL
+    // ("off scale") instead of the numeric pipeline wrapping it to wrong digits.
+    // numeric.vert scales this by the unit factor before decoding (ft = m*3.28084),
+    // so the displayed value reaches ~32807 in feet: the HUD's fixed-width field
+    // (`agl_slots` in hud.zig) must hold that many digits (5). GA/helo AGL stays
+    // well within 9999 m either way.
+    agl_m = int(clamp(round(observer_msl_m - elev), 0.0, 9999.0));
+}

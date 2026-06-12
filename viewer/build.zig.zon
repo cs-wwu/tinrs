@@ -1,0 +1,30 @@
+.{
+    .name = .siren_compute,
+    .fingerprint = 0x5946e4029ccd5cae,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .vulkan_zig = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig#3adbeefbc833c12656791d304b37a6315b357745",
+            .hash = "vulkan-0.0.0-r7YtxyBsAwD35FvkFhT2xruTNdCByD3TtGw44XWtfun8",
+        },
+        .vulkan_headers = .{
+            .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/v1.4.309.tar.gz",
+            .hash = "N-V-__8AAPzz4AHlh4uxSRPYF16YYiktAY5ZbN3H69vXPDIC",
+        },
+        .clap = .{
+            .url = "git+https://github.com/Hejsil/zig-clap#27621cb7207643f914bae7b01902b22a8b5916e7",
+            .hash = "clap-0.11.0-oBajBxDoAQChQCl4LRM4tyf-VChKLbhYilS806xxzxrQ",
+        },
+        .sdl = .{
+            .url = "git+https://github.com/allyourcodebase/SDL3#e0e29440988a85ee10875b44aa3008010b0795c0",
+            .hash = "sdl-1.0.1+3.4.4-i4QD0RKGqQAJUQI9ROnx3GrI5pBWFqp_gpzHLYj40jNs",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "shaders",
+    },
+}

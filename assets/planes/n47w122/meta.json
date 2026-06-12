@@ -1,0 +1,18 @@
+{
+  "arch": "plane",
+  "tile": "n47w122",
+  "resolution": 256,
+  "resolution_w": 256,
+  "features": 12,
+  "mlp_hidden_dim": 48,
+  "num_outputs": 4,
+  "elev_min": 2.6565911769866943,
+  "elev_max": 2411.941650390625,
+  "elev_range": 2409.2850592136383,
+  "grad_scale": 0.0843583345413208,
+  "quantized": true,
+  "grid_uints": 196608,
+  "mlp_floats": 820,
+  "total_params": 787252,
+  "source": "train_plane.py"
+}

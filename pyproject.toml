@@ -1,0 +1,12 @@
+[project]
+name = "tinrs"
+version = "0.1.0"
+description = "Neural compression of terrain (DEM) elevation data using Implicit Neural Representations."
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.2",
+    "pillow>=12.1.1",
+    "torch>=2.10.0",
+]

@@ -1,3 +1,29 @@
-.zig-cache/
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Training output
+output/
+
+# Assets (large binary files).
+# The sample model assets/planes/n47w122/ is force-added (git add -f) so the
+# viewer renders real terrain out of the box; everything else here stays ignored.
+assets/maps/
+assets/planes/
+
+# Zig build artifacts
 zig-out/
-*.o
+zig-cache/
+.zig-cache/
+zig-pkg/
+*.bin
+
+# Core dumps
+core.*
+
+# OS
+.DS_Store
+
+# Local editor / tooling state
+.claude/
