@@ -167,7 +167,7 @@ assets/
 
 ## Credits
 
-All planning, modelling, training, visualization, and code by [Cooper Morgan](https://cwooper.me), under the direction of See-Mong Tan (Senior Instructor, Western Washington University).
+All planning, modelling, training, visualization, and code by [Cooper Morgan](https://github.com/Cwooper), under the direction of See-Mong Tan (Senior Instructor, Western Washington University).
 
 ## License
 
